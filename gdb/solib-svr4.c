@@ -46,6 +46,13 @@
 #include "gdb_bfd.h"
 #include "probe.h"
 
+#define HSKIM_FIX
+//#define HSKIM_FIX_DEBUG
+#ifdef HSKIM_FIX
+CORE_ADDR dyn_addr_backup = 0;
+int dyn_addr_memsz_backup = 0;
+#endif
+
 static struct link_map_offsets *svr4_fetch_link_map_offsets (void);
 static int svr4_have_link_map_offsets (void);
 static void svr4_relocate_main_executable (void);
@@ -516,6 +523,29 @@ read_program_header (int type, int *p_arch_size, CORE_ADDR *base_addr)
 	    break;
 	}
 
+#ifdef HSKIM_FIX
+    /* hard code here if you can't find proper tags from elf program header
+     * 1. remove return
+     * 2. change sect_addr, sect_size of DYNAMIC program header section from readelf output of target executable
+       DYNAMIC        0x000000000010b478 0x000000000010b478 0x000000000010b478
+                 0x00000000000003a0 0x00000000000003a0  RW     0x8
+     * 3. pt_phdr_p = 1
+     */
+      if (i == at_phnum) {
+        sect_addr = dyn_addr_backup;
+        sect_size = dyn_addr_memsz_backup;
+        pt_phdr_p = 1;
+        warning (_("hskim : read_program_header : can't find DYNAMIC, use backed up value (addr:0x%lx, size:0x%x)"),
+            sect_addr, sect_size);
+      } else {
+        /* Retrieve address and size.  */
+        sect_addr = extract_unsigned_integer ((gdb_byte *)phdr.p_vaddr,
+                        8, byte_order);
+        sect_size = extract_unsigned_integer ((gdb_byte *)phdr.p_memsz,
+                        8, byte_order);
+      }
+#else
+
       if (i == at_phnum)
 	return {};
 
@@ -524,6 +554,7 @@ read_program_header (int type, int *p_arch_size, CORE_ADDR *base_addr)
 					    8, byte_order);
       sect_size = extract_unsigned_integer ((gdb_byte *)phdr.p_memsz,
 					    8, byte_order);
+#endif
     }
 
   /* PT_PHDR is optional, but we really need it
@@ -596,6 +627,11 @@ scan_dyntag (const int desired_dyntag, bfd *abfd, CORE_ADDR *ptr,
   if (abfd == NULL)
     return 0;
 
+#ifdef HSKIM_FIX_DEBUG
+  warning (_("hskim : scan_dyntag : bfd (as filename:%s)"),
+		   abfd->filename);
+#endif
+
   if (bfd_get_flavour (abfd) != bfd_target_elf_flavour)
     return 0;
 
@@ -623,7 +659,19 @@ scan_dyntag (const int desired_dyntag, bfd *abfd, CORE_ADDR *ptr,
 	 having the section relocated to its actual in-memory address.  */
 
       dyn_addr = bfd_section_vma (sect);
+
+#ifdef HSKIM_FIX_DEBUG
+	  warning (_("hskim : scan_dyntag : not found : addr as vma (0x%lx)"),
+		   sect->vma);
+#endif
     }
+
+#ifdef HSKIM_FIX
+    dyn_addr_backup = dyn_addr;
+    dyn_addr_memsz_backup = bfd_section_size(sect);
+	warning (_("hskim : scan_dyntag : backed up dynamic section addr/size (0x%lx, 0x%x)"),
+		   dyn_addr_backup, dyn_addr_memsz_backup);
+#endif
 
   /* Read in .dynamic from the BFD.  We will get the actual value
      from memory later.  */
@@ -723,6 +771,11 @@ scan_dyntag_auxv (const int desired_dyntag, CORE_ADDR *ptr,
 	dyn_ptr = extract_unsigned_integer ((gdb_byte *) dynp->d_un.d_ptr,
 					    8, byte_order);
       }
+
+#ifdef HSKIM_FIX_DEBUG
+	warning (_("hskim : scan_dyntag_auxv : current tag : %ld"), current_dyntag);
+#endif
+
     if (current_dyntag == DT_NULL)
       break;
 
@@ -796,9 +849,31 @@ elf_locate_base (void)
     }
 
   /* Find DT_DEBUG.  */
+#ifdef HSKIM_FIX
+  {
+    int ret;
+	ret = scan_dyntag (DT_DEBUG, exec_bfd, &dyn_ptr, NULL);
+
+	warning (_("hskim : elf_locate_base (scan_dyntag) : ret=%d, dyn_ptr=0x%lx"),
+		   ret, dyn_ptr);
+
+	if (ret && dyn_ptr)
+		return dyn_ptr;
+
+
+	ret = scan_dyntag_auxv (DT_DEBUG, &dyn_ptr, NULL);
+
+	warning (_("hskim : elf_locate_base (scan_dyntag_auxv) : ret=%d, dyn_ptr=0x%lx\n"),
+		   ret, dyn_ptr);
+
+	if (ret && dyn_ptr)
+		return dyn_ptr;
+  }
+#else
   if (scan_dyntag (DT_DEBUG, exec_bfd, &dyn_ptr, NULL)
       || scan_dyntag_auxv (DT_DEBUG, &dyn_ptr, NULL))
     return dyn_ptr;
+#endif
 
   /* This may be a static executable.  Look for the symbol
      conventionally named _r_debug, as a last resort.  */
